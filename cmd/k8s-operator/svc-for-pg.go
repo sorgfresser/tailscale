@@ -265,6 +265,10 @@ func (r *HAServiceReconciler) maybeProvision(ctx context.Context, hostname strin
 		logger.Info("ConfigMap not yet created, waiting..")
 		return false, nil
 	}
+	serveConfig, err := serveConfigFromConfigMap(cm)
+	if err != nil {
+		return false, fmt.Errorf("error retrieving serve configuration: %w", err)
+	}
 
 	if len(existingTSSvc.Addrs) == 0 {
 		existingTSSvc, err = tsClient.VIPServices().Get(ctx, tsSvc.Name)
@@ -313,15 +317,35 @@ func (r *HAServiceReconciler) maybeProvision(ctx context.Context, hostname strin
 	}
 
 	existingCfg := cfgs[serviceName.String()]
-	if !reflect.DeepEqual(existingCfg, cfg) {
+	ingressConfigChanged := !reflect.DeepEqual(existingCfg, cfg)
+	if ingressConfigChanged {
 		mak.Set(&cfgs, serviceName.String(), cfg)
-		cfgBytes, err := json.Marshal(cfgs)
-		if err != nil {
-			return false, fmt.Errorf("error marshaling ingress config: %w", err)
+	}
+
+	tunConfig := &ipn.ServiceConfig{Tun: true}
+	existingServeConfig := serveConfig.Services[serviceName]
+	serveConfigChanged := !reflect.DeepEqual(existingServeConfig, tunConfig)
+	if serveConfigChanged {
+		mak.Set(&serveConfig.Services, serviceName, tunConfig)
+	}
+
+	if ingressConfigChanged || serveConfigChanged {
+		if ingressConfigChanged {
+			cfgBytes, err := json.Marshal(cfgs)
+			if err != nil {
+				return false, fmt.Errorf("error marshaling ingress config: %w", err)
+			}
+			mak.Set(&cm.BinaryData, ingressservices.IngressConfigKey, cfgBytes)
 		}
-		mak.Set(&cm.BinaryData, ingressservices.IngressConfigKey, cfgBytes)
+		if serveConfigChanged {
+			cfgBytes, err := json.Marshal(serveConfig)
+			if err != nil {
+				return false, fmt.Errorf("error marshaling serve config: %w", err)
+			}
+			mak.Set(&cm.BinaryData, serveConfigKey, cfgBytes)
+		}
 		if err := r.Update(ctx, cm); err != nil {
-			return false, fmt.Errorf("error updating ingress config: %w", err)
+			return false, fmt.Errorf("error updating ingress and serve config: %w", err)
 		}
 	}
 
@@ -413,6 +437,10 @@ func (r *HAServiceReconciler) maybeCleanup(ctx context.Context, hostname string,
 	if cm == nil || cfgs == nil {
 		return true, nil
 	}
+	serveConfig, err := serveConfigFromConfigMap(cm)
+	if err != nil {
+		return false, fmt.Errorf("error retrieving serve configuration: %w", err)
+	}
 	logger.Infof("Removing Tailscale Service %q from ingress config for ProxyGroup %q", hostname, pgName)
 	delete(cfgs, serviceName.String())
 	cfgBytes, err := json.Marshal(cfgs)
@@ -420,6 +448,14 @@ func (r *HAServiceReconciler) maybeCleanup(ctx context.Context, hostname string,
 		return false, fmt.Errorf("error marshaling ingress config: %w", err)
 	}
 	mak.Set(&cm.BinaryData, ingressservices.IngressConfigKey, cfgBytes)
+	if serviceConfig := serveConfig.Services[serviceName]; serviceConfig != nil && serviceConfig.Tun {
+		delete(serveConfig.Services, serviceName)
+		cfgBytes, err := json.Marshal(serveConfig)
+		if err != nil {
+			return false, fmt.Errorf("error marshaling serve config: %w", err)
+		}
+		mak.Set(&cm.BinaryData, serveConfigKey, cfgBytes)
+	}
 	return true, r.Update(ctx, cm)
 }
 
@@ -430,6 +466,13 @@ func (r *HAServiceReconciler) maybeCleanupProxyGroup(ctx context.Context, proxyG
 	if err != nil {
 		return false, fmt.Errorf("failed to get ingress service config: %s", err)
 	}
+	var serveConfig *ipn.ServeConfig
+	if cm != nil {
+		serveConfig, err = serveConfigFromConfigMap(cm)
+		if err != nil {
+			return false, fmt.Errorf("failed to get serve config: %w", err)
+		}
+	}
 
 	svcList := &corev1.ServiceList{}
 	if err = r.Client.List(ctx, svcList, client.MatchingFields{indexIngressProxyGroup: proxyGroupName}); err != nil {
@@ -437,6 +480,7 @@ func (r *HAServiceReconciler) maybeCleanupProxyGroup(ctx context.Context, proxyG
 	}
 
 	ingressConfigChanged := false
+	serveConfigChanged := false
 	for tsSvcName, cfg := range config {
 		found := false
 		for _, svc := range svcList.Items {
@@ -460,21 +504,36 @@ func (r *HAServiceReconciler) maybeCleanupProxyGroup(ctx context.Context, proxyG
 
 			_, ok := config[tsSvcName]
 			if ok {
-				logger.Infof("Removing Tailscale Service %q from serve config", tsSvcName)
+				logger.Infof("Removing Tailscale Service %q from ingress config", tsSvcName)
 				delete(config, tsSvcName)
 				ingressConfigChanged = true
+			}
+			serviceName := tailcfg.ServiceName(tsSvcName)
+			if serviceConfig := serveConfig.Services[serviceName]; serviceConfig != nil && serviceConfig.Tun {
+				logger.Infof("Removing Tailscale Service %q from serve config", tsSvcName)
+				delete(serveConfig.Services, serviceName)
+				serveConfigChanged = true
 			}
 		}
 	}
 
-	if ingressConfigChanged {
-		configBytes, err := json.Marshal(config)
-		if err != nil {
-			return false, fmt.Errorf("marshaling serve config: %w", err)
+	if ingressConfigChanged || serveConfigChanged {
+		if ingressConfigChanged {
+			configBytes, err := json.Marshal(config)
+			if err != nil {
+				return false, fmt.Errorf("marshaling ingress config: %w", err)
+			}
+			mak.Set(&cm.BinaryData, ingressservices.IngressConfigKey, configBytes)
 		}
-		mak.Set(&cm.BinaryData, ingressservices.IngressConfigKey, configBytes)
+		if serveConfigChanged {
+			configBytes, err := json.Marshal(serveConfig)
+			if err != nil {
+				return false, fmt.Errorf("marshaling serve config: %w", err)
+			}
+			mak.Set(&cm.BinaryData, serveConfigKey, configBytes)
+		}
 		if err := r.Update(ctx, cm); err != nil {
-			return false, fmt.Errorf("updating serve config: %w", err)
+			return false, fmt.Errorf("updating ingress and serve config: %w", err)
 		}
 	}
 

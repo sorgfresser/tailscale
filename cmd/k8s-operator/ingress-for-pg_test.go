@@ -271,6 +271,33 @@ func TestIngressPGReconciler(t *testing.T) {
 	expectMissing[networkingv1.Ingress](t, fc, ing3.Namespace, ing3.Name)
 }
 
+func TestIngressPGCleanupPreservesTunServiceConfig(t *testing.T) {
+	ingPGR, fc, ft := setupIngressTest(t)
+	mustUpdate(t, fc, "operator-ns", "test-pg-ingress-config", func(cm *corev1.ConfigMap) {
+		config := &ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			"svc:l3-service": {Tun: true},
+		}}
+		var err error
+		cm.BinaryData[serveConfigKey], err = json.Marshal(config)
+		if err != nil {
+			t.Fatalf("marshaling serve config: %v", err)
+		}
+	})
+	pg := &tsapi.ProxyGroup{}
+	if err := fc.Get(t.Context(), client.ObjectKey{Name: "test-pg"}, pg); err != nil {
+		t.Fatalf("getting ProxyGroup: %v", err)
+	}
+
+	changed, err := ingPGR.maybeCleanupProxyGroup(t.Context(), ingPGR.logger, ft, pg)
+	if err != nil {
+		t.Fatalf("cleaning up Ingress services: %v", err)
+	}
+	if changed {
+		t.Error("Ingress cleanup unexpectedly changed a Tun service")
+	}
+	verifyTunServeConfig(t, fc, "svc:l3-service", true)
+}
+
 func TestIngressPGReconciler_UpdateIngressHostname(t *testing.T) {
 	ingPGR, fc, ft := setupIngressTest(t)
 

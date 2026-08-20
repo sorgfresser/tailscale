@@ -459,7 +459,12 @@ func (r *HAIngressReconciler) maybeCleanupProxyGroup(ctx context.Context, logger
 	// Collect orphans first so we are not mutating cfg.Services during
 	// iteration.
 	var orphans []tailcfg.ServiceName
-	for tsSvcName := range cfg.Services {
+	for tsSvcName, serviceConfig := range cfg.Services {
+		// L3 Services share this config file with L7 Ingresses, but are owned
+		// and cleaned up by HAServiceReconciler.
+		if serviceConfig != nil && serviceConfig.Tun {
+			continue
+		}
 		// ...check if there is currently an Ingress with this hostname
 		found := false
 		for _, i := range ingList.Items {
@@ -572,7 +577,7 @@ func (r *HAIngressReconciler) maybeCleanup(ctx context.Context, hostname string,
 	// its cert loop for this domain before we proceed to delete the
 	// VIPService.
 	if cfg != nil && cfg.Services != nil {
-		if _, ok := cfg.Services[serviceName]; ok {
+		if serviceConfig, ok := cfg.Services[serviceName]; ok && (serviceConfig == nil || !serviceConfig.Tun) {
 			logger.Infof("Removing TailscaleService %q from serve config for ProxyGroup %q", hostname, pg.Name)
 			delete(cfg.Services, serviceName)
 			cfgBytes, err := json.Marshal(cfg)
@@ -650,13 +655,21 @@ func (r *HAIngressReconciler) proxyGroupServeConfig(ctx context.Context, pg stri
 	if apierrors.IsNotFound(err) {
 		return nil, nil, nil
 	}
-	cfg = &ipn.ServeConfig{}
-	if len(cm.BinaryData[serveConfigKey]) != 0 {
-		if err := json.Unmarshal(cm.BinaryData[serveConfigKey], cfg); err != nil {
-			return nil, nil, fmt.Errorf("error unmarshaling ingress serve config %v: %w", cm.BinaryData[serveConfigKey], err)
-		}
+	cfg, err = serveConfigFromConfigMap(cm)
+	if err != nil {
+		return nil, nil, err
 	}
 	return cm, cfg, nil
+}
+
+func serveConfigFromConfigMap(cm *corev1.ConfigMap) (*ipn.ServeConfig, error) {
+	cfg := &ipn.ServeConfig{}
+	if len(cm.BinaryData[serveConfigKey]) != 0 {
+		if err := json.Unmarshal(cm.BinaryData[serveConfigKey], cfg); err != nil {
+			return nil, fmt.Errorf("error unmarshaling ingress serve config %v: %w", cm.BinaryData[serveConfigKey], err)
+		}
+	}
+	return cfg, nil
 }
 
 // shouldExpose returns true if the Ingress should be exposed over Tailscale in HA mode (on a ProxyGroup).

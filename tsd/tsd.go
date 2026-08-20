@@ -33,6 +33,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
 	"tailscale.com/proxymap"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
@@ -126,6 +127,7 @@ type NetstackImpl interface {
 	UpdateNetstackIPs(*netmap.NetworkMap)
 	UpdateIPServiceMappings(netmap.IPServiceMappings)
 	UpdateActiveVIPServices(views.Slice[string])
+	UpdateTunVIPServices(views.Slice[tailcfg.ServiceName])
 }
 
 // Set is a convenience method to set a subsystem value.

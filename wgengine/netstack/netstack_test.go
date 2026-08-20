@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store/mem"
@@ -32,11 +34,14 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -108,11 +113,14 @@ func getMemStats() (ms runtime.MemStats) {
 }
 
 func makeNetstack(tb testing.TB, config func(*Impl)) *Impl {
+	return makeNetstackWithLogf(tb, config, tstest.WhileTestRunningLogger(tb))
+}
+
+func makeNetstackWithLogf(tb testing.TB, config func(*Impl), logf logger.Logf) *Impl {
 	tunDev := tstun.NewFake()
 	sys := tsd.NewSystem()
 	sys.Set(new(mem.Store))
 	dialer := new(tsdial.Dialer)
-	logf := tstest.WhileTestRunningLogger(tb)
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		Tun:           tunDev,
 		Dialer:        dialer,
@@ -1184,6 +1192,102 @@ func TestHandleLocalPackets(t *testing.T) {
 			t.Errorf("got filter outcome %v, want filter.Accept", resp)
 		}
 	})
+}
+
+func TestHandleLocalPacketsVIPServiceMode(t *testing.T) {
+	if !buildfeatures.HasServe {
+		t.Skip("Serve support omitted")
+	}
+	const (
+		tunService   = tailcfg.ServiceName("svc:internal-ai-gateway")
+		serveService = tailcfg.ServiceName("svc:internal-ai-gateway-ui")
+	)
+	tunVIP := netip.MustParseAddr("100.119.59.171")
+	serveVIP := netip.MustParseAddr("100.117.139.82")
+	logCh := make(chan string, 1)
+	baseLogf := tstest.WhileTestRunningLogger(t)
+	logf := func(format string, args ...any) {
+		baseLogf(format, args...)
+		msg := fmt.Sprintf(format, args...)
+		if strings.Contains(msg, "The destination service doesn't have a TCP handler set.") {
+			select {
+			case logCh <- msg:
+			default:
+			}
+		}
+	}
+
+	impl := makeNetstackWithLogf(t, func(impl *Impl) {
+		impl.ProcessSubnets = false
+		impl.ProcessLocalIPs = false
+		impl.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+			return addr == tunVIP || addr == serveVIP
+		})
+	}, logf)
+
+	impl.lb.ForTest().SetIPServiceMappings(netmap.IPServiceMappings{
+		tunVIP:   tunService,
+		serveVIP: serveService,
+	})
+
+	prefs := ipn.NewPrefs()
+	prefs.AdvertiseServices = []string{tunService.String(), serveService.String()}
+	if _, err := impl.lb.EditPrefs(&ipn.MaskedPrefs{
+		Prefs:                *prefs,
+		AdvertiseServicesSet: true,
+	}); err != nil {
+		t.Fatalf("EditPrefs: %v", err)
+	}
+	config := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			tunService: {Tun: true},
+			serveService: {
+				TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			},
+		},
+	}
+	// Install the config directly so the packet-path regression test does not
+	// depend on profile storage setup.
+	impl.lb.ForTest().SetServeConfig(config.View())
+	impl.UpdateTunVIPServices(views.SliceOf([]tailcfg.ServiceName{tunService}))
+
+	client := netip.MustParseAddr("100.101.102.103")
+	pktBytes := tcp4syn(t, client, tunVIP, 12345, 443)
+	var pkt packet.Parsed
+	pkt.Decode(pktBytes)
+	if resp, _ := impl.handleLocalPackets(&pkt, impl.tundev, nil); resp != filter.Accept {
+		select {
+		case msg := <-logCh:
+			t.Fatalf("Tun Service packet entered Serve netstack and logged %q; want filter.Accept for normal TUN processing", msg)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Tun Service packet: got %v, want filter.Accept (normal TUN processing)", resp)
+		}
+	}
+	select {
+	case msg := <-logCh:
+		t.Fatalf("Tun Service packet unexpectedly logged %q", msg)
+	default:
+	}
+
+	udpBytes := udp4raw(t, client, tunVIP, 12345, 53, nil)
+	var udpPacket packet.Parsed
+	udpPacket.Decode(udpBytes)
+	if resp, _ := impl.handleLocalPackets(&udpPacket, impl.tundev, nil); resp != filter.Accept {
+		t.Fatalf("Tun Service UDP packet: got %v, want filter.Accept (normal TUN processing)", resp)
+	}
+
+	servePacketBytes := tcp4syn(t, client, serveVIP, 12346, 8443)
+	var servePacket packet.Parsed
+	servePacket.Decode(servePacketBytes)
+	if resp, _ := impl.handleLocalPackets(&servePacket, impl.tundev, nil); resp != filter.DropSilently {
+		t.Fatalf("userspace Serve packet: got %v, want filter.DropSilently", resp)
+	}
+	select {
+	case msg := <-logCh:
+		t.Logf("userspace Serve packet reached the expected handler path: %s", msg)
+	case <-time.After(5 * time.Second):
+		t.Fatal("userspace Serve packet did not reach the expected handler path")
+	}
 }
 
 // TestAcceptTCPRoutingTailscaleIPRange tests how acceptTCP behaves for TCP SYN

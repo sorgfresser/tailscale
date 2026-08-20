@@ -61,6 +61,9 @@ func init() {
 	hookServeSetTCPPortsInterceptedFromNetmapAndPrefsLocked.Set(serveSetTCPPortsInterceptedFromNetmapAndPrefsLocked)
 	hookServeClearVIPServicesTCPPortsInterceptedLocked.Set(func(b *LocalBackend) {
 		b.setVIPServicesTCPPortsInterceptedLocked(nil)
+		if ns, ok := b.sys.Netstack.GetOK(); ok {
+			ns.UpdateTunVIPServices(views.SliceOf([]tailcfg.ServiceName(nil)))
+		}
 	})
 
 	hookMaybeMutateHostinfoLocked.Add(maybeUpdateHostinfoServicesHashLocked)
@@ -1604,8 +1607,27 @@ func serveSetTCPPortsInterceptedFromNetmapAndPrefsLocked(b *LocalBackend, prefs 
 	}
 
 	b.setVIPServicesTCPPortsInterceptedLocked(vipServicesPorts)
+	if ns, ok := b.sys.Netstack.GetOK(); ok {
+		ns.UpdateTunVIPServices(views.SliceOf(tunVIPServicesFromConfig(b.serveConfig)))
+	}
 
 	return handlePorts
+}
+
+// tunVIPServicesFromConfig returns services whose packets are handled by the
+// host network stack.
+func tunVIPServicesFromConfig(config ipn.ServeConfigView) []tailcfg.ServiceName {
+	if !config.Valid() {
+		return nil
+	}
+	var services []tailcfg.ServiceName
+	for service, serviceConfig := range config.Services().All() {
+		if serviceConfig.Tun() {
+			services = append(services, service)
+		}
+	}
+	slices.Sort(services)
+	return services
 }
 
 // reloadServeConfigLocked reloads the serve config from the store or resets the

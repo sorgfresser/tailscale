@@ -40,6 +40,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
@@ -562,6 +563,97 @@ func TestServeConfigServices(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTunVIPServicesFromConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *ipn.ServeConfig
+		want   []tailcfg.ServiceName
+	}{
+		{
+			name: "mixed modes",
+			config: &ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+				"svc:explicit-tun": {Tun: true},
+				"svc:serve":        {TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}}},
+			}},
+			want: []tailcfg.ServiceName{"svc:explicit-tun"},
+		},
+		{
+			name: "userspace only",
+			config: &ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+				"svc:serve": {TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}}},
+			}},
+		},
+		{name: "no config"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tunVIPServicesFromConfig(tt.config.View()); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("tunVIPServicesFromConfig = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type recordingNetstackForServeTest struct {
+	tunServices []string
+}
+
+func (*recordingNetstackForServeTest) Start(tsd.LocalBackend) error         { return nil }
+func (*recordingNetstackForServeTest) UpdateNetstackIPs(*netmap.NetworkMap) {}
+func (*recordingNetstackForServeTest) UpdateIPServiceMappings(netmap.IPServiceMappings) {
+}
+func (*recordingNetstackForServeTest) UpdateActiveVIPServices(views.Slice[string]) {}
+func (ns *recordingNetstackForServeTest) UpdateTunVIPServices(services views.Slice[tailcfg.ServiceName]) {
+	ns.tunServices = make([]string, 0, services.Len())
+	for _, service := range services.All() {
+		ns.tunServices = append(ns.tunServices, service.String())
+	}
+}
+
+func TestServeConfigUpdatesTunVIPServices(t *testing.T) {
+	b := newTestBackend(t)
+	ns := new(recordingNetstackForServeTest)
+	b.sys.Netstack.Set(ns)
+	prefs := ipn.NewPrefs()
+	prefs.AdvertiseServices = []string{"svc:serve", "svc:explicit-tun", "svc:unserved"}
+	if _, err := b.EditPrefs(&ipn.MaskedPrefs{
+		Prefs:                *prefs,
+		AdvertiseServicesSet: true,
+	}); err != nil {
+		t.Fatalf("EditPrefs: %v", err)
+	}
+
+	config := &ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+		"svc:explicit-tun": {Tun: true},
+		"svc:serve":        {TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}}},
+	}}
+	if err := b.SetServeConfig(config, ""); err != nil {
+		t.Fatalf("SetServeConfig: %v", err)
+	}
+	if got, want := ns.tunServices, []string{"svc:explicit-tun"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Tun services after setting config = %v, want %v", got, want)
+	}
+
+	if err := b.SetServeConfig(&ipn.ServeConfig{}, ""); err != nil {
+		t.Fatalf("clearing ServeConfig: %v", err)
+	}
+	if got := ns.tunServices; len(got) != 0 {
+		t.Errorf("Tun services after clearing ServeConfig = %v, want none", got)
+	}
+
+	prefs.AdvertiseServices = nil
+	if _, err := b.EditPrefs(&ipn.MaskedPrefs{
+		Prefs:                *prefs,
+		AdvertiseServicesSet: true,
+	}); err != nil {
+		t.Fatalf("clearing AdvertiseServices: %v", err)
+	}
+	if got := ns.tunServices; len(got) != 0 {
+		t.Errorf("Tun services after clearing AdvertiseServices = %v, want none", got)
 	}
 }
 

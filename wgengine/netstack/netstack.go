@@ -243,6 +243,7 @@ type Impl struct {
 	atomicIPVIPServiceMap syncs.AtomicValue[netmap.IPServiceMappings]
 	// make this a set of strings for faster lookup
 	atomicActiveVIPServices syncs.AtomicValue[set.Set[tailcfg.ServiceName]]
+	atomicTunVIPServices    syncs.AtomicValue[set.Set[tailcfg.ServiceName]]
 
 	// forwardDialFunc, if non-nil, is the net.Dialer.DialContext-style
 	// function that is used to make outgoing connections when forwarding a
@@ -828,6 +829,14 @@ func (ns *Impl) UpdateActiveVIPServices(activeServices views.Slice[string]) {
 	ns.atomicActiveVIPServices.Store(activeServicesSet)
 }
 
+// UpdateTunVIPServices updates the set of VIP services configured for L3
+// forwarding by the host network stack.
+func (ns *Impl) UpdateTunVIPServices(tunServices views.Slice[tailcfg.ServiceName]) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	ns.atomicTunVIPServices.Store(set.OfSliceView(tunServices))
+}
+
 func (ns *Impl) isLoopbackPort(port uint16) bool {
 	if ns.loopbackPort != nil && int(port) == *ns.loopbackPort {
 		return true
@@ -879,10 +888,15 @@ func (ns *Impl) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper, gro *gro.
 			// Other host might have the service active, so we let the packet go through.
 			return filter.Accept, gro
 		}
+		if ns.atomicTunVIPServices.Load().Contains(serviceName) {
+			// Tun services are forwarded by the host network stack. Their packets
+			// normally bypass this hook, but can re-enter the TUN datapath after
+			// kernel routing or conntrack processing. Leave those packets on the
+			// normal TUN path instead of absorbing them into the Serve netstack.
+			return filter.Accept, gro
+		}
 		if p.IPProto != ipproto.TCP {
-			// We currenly only support VIP services over TCP. If service is in Tun mode,
-			// it's up to the service host to set up local packet handling which shouldn't
-			// arrive here.
+			// Userspace VIP services currently only support TCP.
 			return filter.DropSilently, gro
 		}
 		if debugNetstack() {

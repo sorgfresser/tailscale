@@ -24,11 +24,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"tailscale.com/client/tailscale/v2"
 
+	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/util/mak"
 )
@@ -47,6 +49,7 @@ func TestServicePGReconciler(t *testing.T) {
 		config = append(config, fmt.Sprintf("svc:default-%s", svc.Name))
 		verifyTailscaleService(t, ft, fmt.Sprintf("svc:default-%s", svc.Name), []string{"do-not-validate"})
 		verifyTailscaledConfig(t, fc, "test-pg", config)
+		verifyTunServeConfig(t, fc, fmt.Sprintf("svc:default-%s", svc.Name), true)
 	}
 
 	for i, svc := range svcs {
@@ -76,7 +79,37 @@ func TestServicePGReconciler(t *testing.T) {
 
 		config = removeEl(config, fmt.Sprintf("svc:default-%s", svc.Name))
 		verifyTailscaledConfig(t, fc, "test-pg", config)
+		verifyTunServeConfig(t, fc, fmt.Sprintf("svc:default-%s", svc.Name), false)
 	}
+}
+
+func TestServicePGReconcilerPreservesL7ServeConfig(t *testing.T) {
+	svcPGR, stateSecret, fc, _, _ := setupServiceTest(t)
+	const l7Service = tailcfg.ServiceName("svc:existing-l7")
+	mustUpdate(t, fc, "operator-ns", "test-pg-ingress-config", func(cm *corev1.ConfigMap) {
+		config := &ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			l7Service: {
+				TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			},
+		}}
+		var err error
+		cm.BinaryData[serveConfigKey], err = json.Marshal(config)
+		if err != nil {
+			t.Fatalf("marshaling serve config: %v", err)
+		}
+	})
+
+	svc, _ := setupTestService(t, "test-service", "", "1.2.3.4", fc, stateSecret)
+	expectReconciled(t, svcPGR, svc.Namespace, svc.Name)
+	verifyTunServeConfig(t, fc, "svc:default-test-service", true)
+	verifyL7ServeConfig(t, fc, l7Service)
+
+	if err := fc.Delete(t.Context(), svc); err != nil {
+		t.Fatalf("deleting Service: %v", err)
+	}
+	expectReconciled(t, svcPGR, svc.Namespace, svc.Name)
+	verifyTunServeConfig(t, fc, "svc:default-test-service", false)
+	verifyL7ServeConfig(t, fc, l7Service)
 }
 
 func TestServicePGReconciler_UpdateHostname(t *testing.T) {
@@ -89,6 +122,7 @@ func TestServicePGReconciler_UpdateHostname(t *testing.T) {
 
 	verifyTailscaleService(t, ft, fmt.Sprintf("svc:default-%s", svc.Name), []string{"do-not-validate"})
 	verifyTailscaledConfig(t, fc, "test-pg", []string{fmt.Sprintf("svc:default-%s", svc.Name)})
+	verifyTunServeConfig(t, fc, fmt.Sprintf("svc:default-%s", svc.Name), true)
 
 	hostname := "foobarbaz"
 	mustUpdate(t, fc, svc.Namespace, svc.Name, func(s *corev1.Service) {
@@ -101,6 +135,8 @@ func TestServicePGReconciler_UpdateHostname(t *testing.T) {
 
 	verifyTailscaleService(t, ft, fmt.Sprintf("svc:%s", hostname), []string{"do-not-validate"})
 	verifyTailscaledConfig(t, fc, "test-pg", []string{fmt.Sprintf("svc:%s", hostname)})
+	verifyTunServeConfig(t, fc, fmt.Sprintf("svc:default-%s", svc.Name), false)
+	verifyTunServeConfig(t, fc, fmt.Sprintf("svc:%s", hostname), true)
 
 	_, err := ft.VIPServices().Get(context.Background(), fmt.Sprintf("svc:default-%s", svc.Name))
 	if err == nil {
@@ -465,6 +501,50 @@ func TestIgnoreRegularService(t *testing.T) {
 		if len(tsSvcs) > 0 {
 			t.Fatal("unexpected Tailscale Services found")
 		}
+	}
+}
+
+func verifyTunServeConfig(t *testing.T, fc client.Client, serviceName string, want bool) {
+	t.Helper()
+	cm := &corev1.ConfigMap{}
+	if err := fc.Get(t.Context(), types.NamespacedName{
+		Name:      "test-pg-ingress-config",
+		Namespace: "operator-ns",
+	}, cm); err != nil {
+		t.Fatalf("getting ConfigMap: %v", err)
+	}
+	config, err := serveConfigFromConfigMap(cm)
+	if err != nil {
+		t.Fatalf("unmarshaling serve config: %v", err)
+	}
+	serviceConfig, ok := config.Services[tailcfg.ServiceName(serviceName)]
+	if !want {
+		if ok {
+			t.Errorf("service %q still present in serve config: %+v", serviceName, serviceConfig)
+		}
+		return
+	}
+	if !ok || serviceConfig == nil || !serviceConfig.Tun {
+		t.Errorf("service %q has serve config %+v, want Tun mode", serviceName, serviceConfig)
+	}
+}
+
+func verifyL7ServeConfig(t *testing.T, fc client.Client, serviceName tailcfg.ServiceName) {
+	t.Helper()
+	cm := &corev1.ConfigMap{}
+	if err := fc.Get(t.Context(), types.NamespacedName{
+		Name:      "test-pg-ingress-config",
+		Namespace: "operator-ns",
+	}, cm); err != nil {
+		t.Fatalf("getting ConfigMap: %v", err)
+	}
+	config, err := serveConfigFromConfigMap(cm)
+	if err != nil {
+		t.Fatalf("unmarshaling serve config: %v", err)
+	}
+	serviceConfig := config.Services[serviceName]
+	if serviceConfig == nil || serviceConfig.TCP[443] == nil || !serviceConfig.TCP[443].HTTPS {
+		t.Errorf("L7 service %q has serve config %+v, want HTTPS on port 443", serviceName, serviceConfig)
 	}
 }
 
